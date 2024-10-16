@@ -147,7 +147,7 @@ class outcomes_job extends job {
         $plugin = api::get_enrolment_plugin();
         $pluginconfig = $plugin->get_plugin_config();
         $lockfactory = static::get_lock_factory();
-        $lock = $lockfactory->get_lock($this->get_lock_resource(), self::TIME_LOCK_TIMEOUT);
+        $lock = $lockfactory->get_lock($this->get_lock_resource(), self::TIME_LOCK_OUTCOMEJOB);
         if ($lock) {
             try {
                 $limit = $pluginconfig->get('outcomejobdefaultlimit');
@@ -244,7 +244,9 @@ class outcomes_job extends job {
             $lock->release();
             return true;
         } else {
-            throw new moodle_exception('locktimeout');
+            // Job may not have completed in time. Just return false.
+            $this->add_error('locktimeout');
+            return false;
         }
     }
 }

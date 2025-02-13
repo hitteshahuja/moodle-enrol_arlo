@@ -40,6 +40,9 @@ use enrol_arlo\local\persistent\online_activity_persistent;
 use enrol_arlo\local\persistent\user_persistent;
 use enrol_arlo\local\user_matcher;
 use enrol_arlo\persistent;
+use enrol_arlo\Arlo\AuthAPI\XmlDeserializer;
+use DOMDocument;
+use enrol_arlo\Arlo\AuthAPI\Resource\Field;
 use enrol_arlo\Arlo\AuthAPI\RequestUri;
 use enrol_arlo\local\client;
 use enrol_arlo\local\persistent\contact_persistent;
@@ -167,10 +170,10 @@ class memberships_job extends job {
                     $collection = response_processor::process($response);
                     if ($collection->count() > 0) {
                         foreach ($collection as $resource) {
-                            $reglock = $lockfactory->get_lock('Registration: ' . 
+                            $reglock = $lockfactory->get_lock('Registration: ' .
                                 $resource->RegistrationID, self::TIME_LOCK_TIMEOUT);
                             if ($reglock) {
-                                try{
+                                try {
                                     $this->sync_resource($resource, $trace);
                                 } catch (moodle_exception $exception) {
                                     debugging($exception->getMessage(), DEBUG_DEVELOPER);
@@ -295,7 +298,7 @@ class memberships_job extends job {
             // getting same 250 each call.
             $hasnext = true;
             $disableskip = get_config('enrol_arlo', 'disableskip');
-            $lastime = empty($disableskip) ? get_config('enrol_arlo', 'lastregtimemodified') : date('c', 0); 
+            $lastime = empty($disableskip) ? get_config('enrol_arlo', 'lastregtimemodified') : date('c', 0);
             $lastregid = empty($disableskip) ? get_config('enrol_arlo', 'lastregid') : 0;
             while ($hasnext) {
                 $hasnext = false; // Break paging by default.
@@ -326,10 +329,10 @@ class memberships_job extends job {
                 if ($collection->count() > 0) {
                     foreach ($collection as $resource) {
                         $lockfactory = static::get_lock_factory();
-                        $lock = $lockfactory->get_lock('Registration: ' . 
+                        $lock = $lockfactory->get_lock('Registration: ' .
                             $resource->RegistrationID, self::TIME_LOCK_TIMEOUT);
                         if ($lock) {
-                            try{
+                            try {
                                 self::sync_membership($resource, $trace);
                             } catch (moodle_exception $exception) {
                                 debugging($exception->getMessage(), DEBUG_DEVELOPER);
@@ -343,7 +346,7 @@ class memberships_job extends job {
                     $lastregid = $resource->RegistrationID;
                     $lastime = $resource->LastModifiedDateTime;
                     set_config('lastregtimemodified', $lastime, 'enrol_arlo');
-                    set_config('lastregid', $lastregid,  'enrol_arlo');
+                    set_config('lastregid', $lastregid, 'enrol_arlo');
                     $hasnext = (bool) $collection->hasNext();
                 }
             }
@@ -417,7 +420,7 @@ class memberships_job extends job {
         $membershipsjob = job_factory::create_from_persistent($membershipsjobpersistent);
         $trace->output("Syncing Registration {$resource->UniqueIdentifier}");
         $membershipsjob->sync_resource($resource);
-        
+
         if ($membershipsjob->has_errors()) {
             $trace->output("Registration {$resource->UniqueIdentifier} failed with errors.", 1);
             $trace->output(implode('\n', $membershipsjob->get_errors()));
@@ -543,8 +546,8 @@ class memberships_job extends job {
      * @throws moodle_exception
      */
     public static function process_enrolment_registration(stdClass $enrolmentinstance,
-                                                          registration_persistent $registration,
-                                                          contact_persistent $contact = null) {
+        registration_persistent $registration,
+        contact_persistent $contact = null) {
         // Load plugin class instance.
         $plugin = api::get_enrolment_plugin();
         // Get plugin config.
@@ -634,6 +637,7 @@ class memberships_job extends job {
                     }
                 }
             } else {
+                $customfields = self::process_customfields_for_contact($contact->get('sourceid'));
                 // Get contacts associated user.
                 $user = user_persistent::get_record_and_unset(
                     ['id' => $contact->get('userid'), 'deleted' => 0]
@@ -653,8 +657,17 @@ class memberships_job extends job {
                         $user->set('idnumber', $contact->get('codeprimary'));
                     }
                 }
+                foreach ($customfields as $customfield) {
+                    //if Name is BirthDate, then try and convert it to unixtime.
+                    if ($customfield->Name == 'BirthDate') {
+                        $customfield->Value = strtotime($customfield->Value);
+                        echo "\n Setting $customfield->Name for user id " . $user->get('id') . " to " . $customfield->Value;
+                    }
+                    $user->set('profile_field_' . $customfield->Name, $customfield->Value);
+                }
                 $user->set('phone1', $contact->get('phonemobile'));
                 $user->set('phone2', $contact->get('phonework'));
+                $user->update();
                 $user->update_user();
 
             }
@@ -685,14 +698,14 @@ class memberships_job extends job {
         $contactresource = $resource->getContact();
         if (empty($contactresource)) {
             throw new moodle_exception('missingresource',
-                null, null,  null, 'contact');
+                null, null, null, 'contact');
         }
         // Require event or online activity resource to be attached.
         $eventresource = $resource->getEvent();
         $onlineactivityresource = $resource->getOnlineActivity();
         if (empty($eventresource) && empty($onlineactivityresource)) {
             throw new moodle_exception('missingresource',
-                null, null,  null, 'course'); // Course is Event ot Online Activity.
+                null, null, null, 'course'); // Course is Event ot Online Activity.
         }
         // Check for existing registration record.
         $registration = registration_persistent::get_record(
@@ -756,6 +769,51 @@ class memberships_job extends job {
         $registration->save();
         // Return registration and contact persistents.
         return array($registration, $contact);
+    }
+    public static function process_customfields_for_contact($contactsourceid, $filterfields = ['BirthDate', 'passportnumber']) {
+        $plugin = api::get_enrolment_plugin();
+        $pluginconfig = $plugin->get_plugin_config();
+        $uri = new RequestUri();
+        $uri->setHost($pluginconfig->get('platform'));
+        $uri->setResourcePath('contacts/' . $contactsourceid . '/customfields');
+        $request = new Request('GET', $uri->output(true));
+        $response = client::get_instance()->send_request($request);
+        $statuscode = $response->getStatusCode();
+        if ($statuscode != 200) {
+            throw new moodle_exception('httpstatus:' . $statuscode);
+        }
+        $contenttype = $response->getHeaderLine('content-type');
+        if (strpos($contenttype, 'application/xml') === false) {
+            throw new moodle_exception('httpstatus:415', 'enrol_arlo');
+        }
+        $deserializer = new XmlDeserializer("enrol_arlo\\Arlo\\AuthAPI\\Resource\\");
+        $stream = $response->getBody();
+        $contents = $stream->getContents();
+        if ($stream->eof()) {
+            $stream->rewind();
+        }
+        $doc = new DOMDocument();
+        $doc->loadXML($contents);
+
+        $fields = $doc->getElementsByTagName('Field');
+
+        foreach ($fields as $field) {
+            $name = $field->getElementsByTagName('Name')->item(0)->nodeValue;
+            $value = $field->getElementsByTagName('Value')->item(0)->nodeValue;
+            $field_resource = new Field();
+            if (!empty($filterfields) && !in_array($name, $filterfields)) {
+                continue;
+            }
+            $field_resource->Name = $name;
+            $field_resource->Value = $value;
+            $fieldResources[] = $field_resource;
+            // Store the name and value in the Field Resource
+            // ...
+        }
+        // $content looks like <CustomFields><Field><Name><Value></Field><Field><Name><Value></Field>
+        // Process each field's name and value and store it in the Field Resource.
+
+        return $fieldResources;
     }
 
 }
